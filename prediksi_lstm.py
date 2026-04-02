@@ -97,7 +97,7 @@ tanggal_terakhir = df.index[-1]
 tanggal_prediksi = pd.date_range(start=tanggal_terakhir + pd.Timedelta(days=1), periods=hari_kedepan, freq='D')
 
 # Ambil data historis setahun terakhir saja agar grafik tidak terlalu padat
-df_historis = df.last('365D')
+df_historis = df.tail(365)
 
 plt.figure(figsize=(14, 7))
 plt.plot(df_historis.index, df_historis['harga'], label='Data Aktual Historis', color='blue')
