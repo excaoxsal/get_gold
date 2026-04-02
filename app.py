@@ -1,4 +1,3 @@
-import streamlit as st
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -7,112 +6,115 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import warnings
-import tensorflow as tf
 
 warnings.filterwarnings('ignore')
 
-# 1. KONFIGURASI HALAMAN (Mobile Friendly)
-st.set_page_config(page_title="Prediksi Emas AI", layout="centered")
+print("📥 1. Mengambil data dari SQLite...")
+conn = sqlite3.connect('monitoring_emas.db')
+df = pd.read_sql_query("SELECT tanggal, harga FROM harga_harian WHERE harga IS NOT NULL", conn)
+conn.close()
 
-st.title("📈 Prediksi Harga Emas AI")
-st.markdown("Aplikasi web ini menggunakan **Long Short-Term Memory (LSTM)** untuk memprediksi harga emas Antam selama 6 bulan ke depan.")
+# --- PREPROCESSING ---
+print("⚙️ 2. Memproses dan membersihkan data...")
+df['tanggal'] = pd.to_datetime(df['tanggal'], format='mixed') # Added format='mixed' to handle inconsistent date formats
+df = df.groupby('tanggal')['harga'].mean().reset_index() # Atasi duplikat
+df = df.sort_values('tanggal').set_index('tanggal')
+df = df.resample('D').ffill() # Isi tanggal bolong/hari libur
 
-# 2. FUNGSI AMBIL DATA (Di-cache agar cepat)
-@st.cache_data
-def load_data():
-    conn = sqlite3.connect('monitoring_emas.db')
-    df = pd.read_sql_query("SELECT tanggal, harga FROM harga_harian WHERE harga IS NOT NULL", conn)
-    conn.close()
-    
-    df['tanggal'] = pd.to_datetime(df['tanggal'], format='mixed')
-    df = df.groupby('tanggal')['harga'].mean().reset_index()
-    df = df.sort_values('tanggal').set_index('tanggal')
-    df = df.resample('D').ffill()
-    return df
+# Ambil nilai harganya saja
+dataset = df['harga'].values
+dataset = dataset.reshape(-1, 1)
 
-# 3. FUNGSI TRAINING MODEL (Di-cache agar tidak diulang saat refresh halaman)
-@st.cache_resource
-def train_model(_df):
-    dataset = _df['harga'].values.reshape(-1, 1)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(dataset)
+print("⚖️ 3. Menormalisasi Data (Skala 0 sampai 1)...")
+# LSTM sangat sensitif terhadap angka besar, kita ubah jutaan rupiah jadi angka 0-1
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(dataset)
 
-    lookback = 60
-    x_train, y_train = [], []
-    for i in range(lookback, len(scaled_data)):
-        x_train.append(scaled_data[i-lookback:i, 0])
-        y_train.append(scaled_data[i, 0])
+# --- MEMBUAT DATASET UNTUK LSTM ---
+# Kita gunakan 60 hari ke belakang (lookback) untuk memprediksi 1 hari ke depan
+lookback = 60
+x_train, y_train = [], []
 
-    x_train, y_train = np.array(x_train), np.array(y_train)
-    x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
+for i in range(lookback, len(scaled_data)):
+    x_train.append(scaled_data[i-lookback:i, 0]) # Memori masa lalu (xt, ht-1)
+    y_train.append(scaled_data[i, 0])            # Target jawaban (Harga aktual)
 
-    model = Sequential()
-    model.add(LSTM(units=50, return_sequences=True, input_shape=(x_train.shape[1], 1)))
-    model.add(Dropout(0.2))
-    model.add(LSTM(units=50, return_sequences=False))
-    model.add(Dropout(0.2))
-    model.add(Dense(units=1))
+x_train, y_train = np.array(x_train), np.array(y_train)
 
-    model.compile(optimizer='adam', loss='mean_squared_error')
+# Format ulang x_train menjadi 3 Dimensi [jumlah_sampel, langkah_waktu, fitur]
+x_train = np.reshape(x_train, (x_train.shape[0], x_train.shape[1], 1))
 
-    # Buat Progress Bar di UI Website
-    progress_bar = st.progress(0, text="Menginisialisasi mesin AI...")
+# --- MEMBANGUN MODEL (ARSITEKTUR OTAK) ---
+print("🧠 4. Membangun Arsitektur LSTM...")
+model = Sequential()
 
-    # Callback untuk mengupdate Progress Bar Web secara real-time
-    class WebCallback(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, epoch, logs=None):
-            persentase = (epoch + 1) / 20
-            progress_bar.progress(persentase, text=f"Sedang belajar dari data historis... (Epoch {epoch+1}/20)")
+# Layer LSTM Pertama (Return sequences=True agar memori dilanjutkan ke layer berikutnya)
+model.add(LSTM(units=50, return_sequences=True, input_shape=(x_train.shape[1], 1)))
+model.add(Dropout(0.2)) # Mematikan 20% neuron acak agar mesin tidak sekadar menghafal (Overfitting)
 
-    model.fit(x_train, y_train, epochs=20, batch_size=32, verbose=0, callbacks=[WebCallback()])
-    progress_bar.empty() # Hilangkan baris loading setelah selesai
+# Layer LSTM Kedua
+model.add(LSTM(units=50, return_sequences=False))
+model.add(Dropout(0.2))
 
-    return model, scaler, scaled_data
+# Layer Output (Dense Layer) untuk menghasilkan 1 angka tebakan harga
+model.add(Dense(units=1))
 
-# --- TAMPILAN USER INTERFACE (UI) ---
+# Compile model (Menentukan cara mesin menghitung error dan memperbaiki bobot/Weight)
+model.compile(optimizer='adam', loss='mean_squared_error')
 
-df = load_data()
-st.info(f"Berhasil memuat **{len(df)}** baris data historis dari database.")
+# --- PROSES BELAJAR (TRAINING) ---
+print("🏋️ 5. Memulai Proses Belajar (Training)... Mohon tunggu sebentar.")
+# Epochs = Berapa kali mesin membaca seluruh data
+# Batch_size = Mesin mengevaluasi per 32 baris data sekaligus
+model.fit(x_train, y_train, epochs=20, batch_size=32, verbose=1)
 
-# Tombol untuk mengeksekusi Prediksi
-if st.button("Jalankan Prediksi 6 Bulan", type="primary"):
-    
-    # Panggil fungsi training
-    model, scaler, scaled_data = train_model(df)
-    
-    with st.spinner('Meracik hasil ramalan untuk 180 hari ke depan...'):
-        hari_kedepan = 180
-        lookback = 60
-        memori_terakhir = scaled_data[-lookback:]
-        batch_prediksi = memori_terakhir.reshape(1, lookback, 1)
+# --- MEMPREDIKSI MASA DEPAN ---
+print("🔮 6. Memprediksi harga untuk 30 hari ke depan...")
+hari_kedepan = 30
+# Ambil 60 hari terakhir dari data historis untuk pijakan awal tebakan
+memori_terakhir = scaled_data[-lookback:]
+batch_prediksi = memori_terakhir.reshape(1, lookback, 1)
 
-        prediksi_masa_depan = []
-        for i in range(hari_kedepan):
-            tebakan = model.predict(batch_prediksi, verbose=0)[0]
-            prediksi_masa_depan.append(tebakan)
-            batch_prediksi = np.append(batch_prediksi[:, 1:, :], [[tebakan]], axis=1)
+prediksi_masa_depan = []
 
-        prediksi_rupiah = scaler.inverse_transform(prediksi_masa_depan)
+# Loop untuk menebak hari demi hari ke depan
+for i in range(hari_kedepan):
+    # Tebak harga besok
+    tebakan_besok = model.predict(batch_prediksi, verbose=0)[0]
+    prediksi_masa_depan.append(tebakan_besok)
 
-        tanggal_terakhir = df.index[-1]
-        tanggal_prediksi = pd.date_range(start=tanggal_terakhir + pd.Timedelta(days=1), periods=hari_kedepan, freq='D')
-        df_historis = df.tail(365)
+    # Masukkan tebakan besok ke dalam memori, dan buang memori hari paling tua (hari ke-1)
+    # Ini agar mesin bisa menebak lusa menggunakan data hari ini + tebakan besok
+    batch_prediksi = np.append(batch_prediksi[:, 1:, :], [[tebakan_besok]], axis=1)
 
-        # Rendering Grafik untuk Web
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(df_historis.index, df_historis['harga'], label='Data Aktual (1 Tahun)', color='blue')
-        ax.plot(tanggal_prediksi, prediksi_rupiah, label='Prediksi 6 Bulan', color='red', linestyle='dashed')
+# Denormalisasi (Kembalikan angka 0-1 menjadi skala Rupiah)
+prediksi_rupiah = scaler.inverse_transform(prediksi_masa_depan)
 
-        ax.set_title('Proyeksi AI: Harga Emas Antam')
-        ax.set_ylabel('Harga (Rp)')
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.5)
+# --- VISUALISASI ---
+print("📊 7. Menyiapkan Grafik...")
+# Buat deret tanggal untuk masa depan
+tanggal_terakhir = df.index[-1]
+tanggal_prediksi = pd.date_range(start=tanggal_terakhir + pd.Timedelta(days=1), periods=hari_kedepan, freq='D')
 
-        # Format Rupiah
-        ax.ticklabel_format(style='plain', axis='y')
-        y_ticks = ax.get_yticks()
-        ax.set_yticklabels(['{:,.0f}'.format(x) for x in y_ticks])
+# Ambil data historis setahun terakhir saja agar grafik tidak terlalu padat
+df_historis = df.tail(365)
 
-        # Tampilkan grafik di website
-        st.pyplot(fig)
-        st.success("✨ Prediksi selesai!")
+plt.figure(figsize=(14, 7))
+plt.plot(df_historis.index, df_historis['harga'], label='Data Aktual Historis', color='blue')
+plt.plot(tanggal_prediksi, prediksi_rupiah, label=f'Prediksi LSTM {hari_kedepan} Hari', color='red', linestyle='dashed', linewidth=2)
+
+plt.title('Prediksi Harga Emas Antam dengan Machine Learning (LSTM)', fontsize=14)
+plt.xlabel('Tanggal', fontsize=12)
+plt.ylabel('Harga (Rp)', fontsize=12)
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+
+# Format axis Y agar tidak jadi angka eksponensial (e.g., 1e6)
+plt.ticklabel_format(style='plain', axis='y')
+current_yticks = plt.gca().get_yticks()
+plt.gca().set_yticklabels(['{:,.0f}'.format(x) for x in current_yticks])
+
+plt.tight_layout()
+plt.show()
+
+print("\n✨ Proses selesai! Silakan lihat grafik prediksi Anda.")
