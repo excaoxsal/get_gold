@@ -96,7 +96,7 @@ if st.button("Jalankan Prediksi 6 Bulan", type="primary"):
 
         tanggal_terakhir = df.index[-1]
         tanggal_prediksi = pd.date_range(start=tanggal_terakhir + pd.Timedelta(days=1), periods=hari_kedepan, freq='D')
-        df_historis = df.last('365D')
+        df_historis = df.tail(365)
 
         # Rendering Grafik untuk Web
         fig, ax = plt.subplots(figsize=(10, 5))
